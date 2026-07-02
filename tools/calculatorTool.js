@@ -33,26 +33,68 @@ math.import(
   { override: true }
 );
 
+/** mathjs functions we allow to survive the "strip stray words" pass below. */
+const ALLOWED_FUNCS =
+  "sqrt|cbrt|abs|round|floor|ceil|log|log10|log2|ln|exp|sin|cos|tan|asin|acos|atan|pi|tau|e|mod|pow|min|max|gcd|lcm|factorial";
+
 /**
- * Strip common natural-language wrappers so queries like
- * "what is 25 * (4 + 3)?" become the bare expression "25 * (4 + 3)".
- * mathjs handles the rest (functions like sqrt(), constants like pi, ...).
+ * Normalize a natural-language math query into a mathjs-evaluable expression
+ * using ordered regex passes. mathjs stays the evaluator — this only rewrites
+ * the human phrasing into arithmetic. Examples:
+ *   "Calculate 18% GST on 42000." -> "(42000*(18/100))"      => 7560
+ *   "What is 25% of 800?"         -> "(800*(25/100))"        => 200
+ *   "42000 + 18%"                 -> "(42000+(42000*(18/100)))" => 49560
+ *   "15% discount on 2000"        -> "(2000*(15/100))"       => 300
+ *   "100*25" / "2*(5+8)"          -> unchanged
  */
-function extractExpression(query) {
-  return query
-    .replace(/calculate|compute|evaluate|solve|what is|what's|the value of|result of|equals/gi, "")
-    .replace(/[?=]/g, "")
-    .trim();
+function normalizeExpression(query) {
+  let e = ` ${query.toLowerCase()} `;
+
+  // 1. Drop currency symbols/words and thousands separators (42,000 -> 42000).
+  e = e.replace(/[₹$€£]|\brs\.?\b|\binr\b|\busd\b/g, " ");
+  e = e.replace(/(\d),(?=\d{3}(?:\D|$))/g, "$1");
+  e = e.replace(/(\d),(?=\d{3}(?:\D|$))/g, "$1"); // 2nd pass for 1,234,567
+
+  // 2. Strip filler / question words (but NOT "of"/"on" — needed in step 3).
+  e = e.replace(
+    /\b(please|kindly|calculate|compute|evaluate|work out|solve for|solve|find|tell me|what\s+is|what's|whats|how much is|the value of|value of|result of|equals?)\b/g,
+    " "
+  );
+
+  // 3. "X% of Y"  and  "X% <word(s)> on Y"  ->  (Y*(X/100))
+  //    covers "25% of 800", "18% gst on 42000", "15% discount on 2000".
+  e = e.replace(
+    /(\d+(?:\.\d+)?)\s*%\s*(?:of|(?:[a-z]+\s+)*on)\s+(\d+(?:\.\d+)?)/g,
+    "($2*($1/100))"
+  );
+
+  // 4. "Y + X%" / "Y - X%"  ->  (Y ± (Y*(X/100)))   e.g. "42000 + 18%".
+  e = e.replace(
+    /(\d+(?:\.\d+)?)\s*([+\-])\s*(\d+(?:\.\d+)?)\s*%/g,
+    "($1$2($1*($3/100)))"
+  );
+
+  // 5. Any remaining bare "X%"  ->  (X/100).
+  e = e.replace(/(\d+(?:\.\d+)?)\s*%/g, "($1/100)");
+
+  // 6. Remove sentence dots (keep decimals like 3.14) and question marks.
+  e = e.replace(/\.(?!\d)/g, " ").replace(/[?=]/g, " ");
+
+  // 7. Drop leftover words/units (e.g. "gst") that aren't allowed mathjs funcs.
+  e = e.replace(new RegExp(`\\b(?!(?:${ALLOWED_FUNCS})\\b)[a-z]+\\b`, "g"), " ");
+
+  return e.replace(/\s+/g, " ").trim();
 }
 
 /**
  * Evaluate a mathematical expression found in the user's query.
  *
  * @param {string} query - natural-language query containing an expression
- * @returns {Promise<{tool: string, answer: string, expression?: string}>}
+ * @returns {Promise<{tool: string, answer: string, expression: string}>}
+ *          `expression` is the normalized form (shown in the UI/logs).
  */
 export async function calculatorTool(query) {
-  const expression = extractExpression(query);
+  const expression = normalizeExpression(query);
 
   try {
     const result = limitedEvaluate(expression);
@@ -68,7 +110,7 @@ export async function calculatorTool(query) {
     // fault — return a friendly message instead of throwing.
     return {
       tool: "calculator",
-      answer: `Sorry, I couldn't evaluate "${expression}" as a mathematical expression.`,
+      answer: `Sorry, I couldn't evaluate "${query}" as a mathematical expression.`,
       expression,
     };
   }

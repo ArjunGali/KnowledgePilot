@@ -25,18 +25,33 @@ import { createLLM } from "../services/llm.js";
 const TOP_K = 3;
 
 /**
- * The original RAG system prompt. `{context}` and `{input}` are LangChain
- * template variables filled in at invoke time.
+ * System prompt for the RAG chain. `{context}` is filled with retrieved
+ * chunks at invoke time; the prior conversation is supplied separately via a
+ * MessagesPlaceholder (see below).
+ *
+ * IMPORTANT (memory fix): the previous prompt said "use ONLY the retrieved
+ * context ... otherwise say you don't know", which made the model discard
+ * facts the user had stated earlier in the conversation (e.g. "my company is
+ * OpenAI"). It now explicitly answers from BOTH the conversation and the
+ * retrieved context, and only falls back to "I don't know" when neither has
+ * the answer.
  */
-const RAG_SYSTEM_TEMPLATE = `You are a helpful assistant for question-answering tasks.
-Use the following pieces of retrieved context to answer the question.
-If you don't know the answer, just say that you don't know.
-Keep the answer concise.
+const RAG_SYSTEM_TEMPLATE = `You are a helpful, conversational assistant with memory of this chat.
 
-Context:
-{context}
+Answer the user's question using BOTH sources below:
+1. The earlier conversation — the user may have told you facts about themselves
+   (their name, employer, preferences, etc.). Treat those as true.
+2. The retrieved document context.
 
-Answer:`;
+Rules:
+- If the user told you something earlier, use it and refer back to it naturally
+  (e.g. "You previously told me you work for OpenAI.").
+- If the answer is in the document context, answer from it.
+- Only say you don't know if neither the conversation nor the context contains
+  the answer. Keep the answer concise.
+
+Retrieved document context:
+{context}`;
 
 /**
  * Convert the frontend's plain history array into LangChain chat messages.
