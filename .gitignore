@@ -1,1 +1,7 @@
 node_modules
+
+# Environment variables — contains API keys, never commit
+.env
+
+# Multer temp files from upload-based ingestion
+uploads/

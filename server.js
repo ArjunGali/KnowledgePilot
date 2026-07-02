@@ -1,18 +1,36 @@
+/**
+ * server.js
+ * ---------
+ * Express entry point for the Agentic AI Knowledge Assistant.
+ *
+ * Routes:
+ *   POST /api/ingest  multipart upload (field "file": PDF/DOCX/TXT/MD) ->
+ *                     extract text -> chunk -> embed locally -> store in Qdrant
+ *   POST /api/ask     { query } -> planner picks ONE tool -> executor runs it
+ *                     -> { answer, context?, tool, reason, status, executionTimeMs }
+ *
+ * All heavy lifting lives in modules:
+ *   agent/planner.js   - decides which tool to use (OpenRouter, JSON output)
+ *   agent/executor.js  - runs exactly one tool, adds status + timing
+ *   tools/*            - document (RAG), calculator, date, web search
+ *   services/*         - shared LLM factory, local embeddings, Qdrant access
+ */
+
+import "dotenv/config"; // must load first so every module sees the env vars
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import * as fs from "fs";
 import * as path from "path";
 import mammoth from "mammoth";
+// NOTE: pdf-parse's root entry runs debug code when imported from ESM
+// (module.parent is undefined there), so import the library file directly.
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { OpenAIEmbeddings } from "@langchain/openai";
-import { QdrantVectorStore } from "@langchain/qdrant";
-import { ChatOpenAI } from "@langchain/openai";
-import { RunnableSequence } from "@langchain/core/runnables";
-import { StringOutputParser } from "@langchain/core/output_parsers";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
-import "dotenv/config";
+
 import { plan } from "./agent/planner.js";
+import { execute } from "./agent/executor.js";
+import { ingestDocuments, clearCollection } from "./services/qdrant.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -20,181 +38,166 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const upload = multer({ dest: "uploads/" });
+/* ------------------------------------------------------------------ */
+/* Upload-based ingestion                                              */
+/* ------------------------------------------------------------------ */
 
-import { Embeddings } from "@langchain/core/embeddings";
-import { pipeline } from "@xenova/transformers";
+/** File types we know how to extract text from. */
+const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
 
-class LocalEmbeddings extends Embeddings {
-  constructor() {
-    super({});
+// Multer buffers uploads to uploads/ under random names; each temp file is
+// deleted after its text has been extracted and vectorised.
+const upload = multer({
+  dest: "uploads/",
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB cap
+});
+
+/** Chunking parameters (unchanged from the original app). */
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 50,
+});
+
+/**
+ * Extract plain text from an uploaded file based on its extension.
+ * @param {Express.Multer.File} file
+ * @returns {Promise<string>}
+ */
+async function extractText(file) {
+  const ext = path.extname(file.originalname).toLowerCase();
+
+  if (ext === ".pdf") {
+    // pdf-parse works on a raw buffer.
+    const data = await pdfParse(fs.readFileSync(file.path));
+    return data.text;
   }
-  async getPipeline() {
-    if (!this.pipeline) {
-      this.pipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-    }
-    return this.pipeline;
+  if (ext === ".docx") {
+    // .docx is a zip container — mammoth extracts the raw text. (The old
+    // code read it with fs.readFileSync(..., "utf-8"), producing garbage.)
+    const { value } = await mammoth.extractRawText({ path: file.path });
+    return value;
   }
-  async embedDocuments(documents) {
-    const pipe = await this.getPipeline();
-    const results = await Promise.all(documents.map(text => pipe(text, { pooling: "mean", normalize: true })));
-    return results.map(res => Array.from(res.data));
-  }
-  async embedQuery(document) {
-    const pipe = await this.getPipeline();
-    const res = await pipe(document, { pooling: "mean", normalize: true });
-    return Array.from(res.data);
-  }
+  // .txt / .md are already plain text.
+  return fs.readFileSync(file.path, "utf-8");
 }
 
-const embeddings = new LocalEmbeddings();
+/**
+ * POST /api/ingest — upload one document and add it to the knowledge base.
+ * Replaces the previous hardcoded-path ingestion.
+ */
+app.post("/api/ingest", upload.single("file"), async (req, res) => {
+  // Remove the multer temp file no matter how the request ends.
+  const cleanup = () =>
+    req.file && fs.promises.unlink(req.file.path).catch(() => {});
 
-const getQdrantVectorStore = async () => {
-  return await QdrantVectorStore.fromExistingCollection(embeddings, {
-    url: process.env.QDRANT_URL || "http://localhost:6333",
-    collectionName: "rag_collection",
-  });
-};
-
-app.post("/api/ingest", async (req, res) => {
   try {
-    const docPath = "c:\\Users\\phani\\OneDrive\\Documenten\\Rag\\Nvidia DOC.docx";
-    if (!fs.existsSync(docPath)) {
-      return res.status(404).json({ error: "Document not found at the specified path." });
+    if (!req.file) {
+      return res.status(400).json({
+        error:
+          "No file uploaded. Send multipart/form-data with a 'file' field " +
+          `(supported: ${SUPPORTED_EXTENSIONS.join(", ")}).`,
+      });
     }
 
-    console.log("Reading text from file...");
-    const text = fs.readFileSync(docPath, "utf-8");
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+      return res.status(400).json({
+        error: `Unsupported file type "${ext}". Supported: ${SUPPORTED_EXTENSIONS.join(", ")}.`,
+      });
+    }
 
-    console.log("Splitting text into chunks...");
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 500,
-      chunkOverlap: 50,
+    console.log(`[ingest] extracting text from "${req.file.originalname}"...`);
+    const text = await extractText(req.file);
+    if (!text.trim()) {
+      return res.status(400).json({ error: "No text could be extracted from the file." });
+    }
+
+    const docs = await splitter.createDocuments(
+      [text],
+      // Store the source filename as metadata alongside each chunk.
+      [{ source: req.file.originalname }]
+    );
+    console.log(`[ingest] split "${req.file.originalname}" into ${docs.length} chunks; storing in Qdrant...`);
+
+    await ingestDocuments(docs);
+
+    console.log("[ingest] completed successfully");
+    res.json({
+      message: "Ingestion completed successfully!",
+      file: req.file.originalname,
+      chunks: docs.length,
     });
-    const docs = await splitter.createDocuments([text]);
-    console.log(`Split document into ${docs.length} chunks.`);
-
-    console.log("Connecting to Qdrant and storing vectors...");
-    await QdrantVectorStore.fromDocuments(docs, embeddings, {
-      url: process.env.QDRANT_URL || "http://localhost:6333",
-      collectionName: "rag_collection",
-    });
-
-    console.log("Ingestion completed successfully!");
-    res.json({ message: "Ingestion completed successfully!", chunks: docs.length });
   } catch (error) {
-    console.error("Error during ingestion:", error);
+    console.error("[ingest] error:", error);
     res.status(500).json({ error: "Failed to ingest document", details: error.message });
+  } finally {
+    await cleanup();
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* Agentic question answering                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * POST /api/ask — the agent loop: plan -> execute exactly one tool ->
+ * respond with the answer plus planner/execution metadata.
+ */
 app.post("/api/ask", async (req, res) => {
   try {
-    const { query } = req.body;
-
-    if (!query) {
+    // `history` is OPTIONAL and backward compatible: old { query } requests
+    // still work; new requests may add history: [{ role, content }, ...].
+    const { query, history } = req.body;
+    if (!query || typeof query !== "string" || !query.trim()) {
       return res.status(400).json({ error: "Query is required" });
     }
+    const safeHistory = Array.isArray(history) ? history : [];
 
-    // Ask the planner which tool should be used
-    const plannerResult = await plan(query);
+    // 1. PLAN — ask the LLM which tool should handle this query.
+    //    (The planner logs its own decision with timing.)
+    const decision = await plan(query);
 
-    console.log("Planner Decision:", plannerResult);
+    // 2. EXECUTE — run exactly one tool; failures come back structured.
+    //    History is threaded through (only the document tool consumes it).
+    const result = await execute(decision.tool, query, safeHistory);
+    console.log(
+      `[executor] tool=${result.tool} status=${result.status} (${result.executionTimeMs}ms)`
+    );
 
-    console.log(`Question: "${query}"`);
-    let vectorStore;
-    try {
-      vectorStore = await getQdrantVectorStore();
-    } catch (e) {
-      return res.status(500).json({ error: "Failed to connect to Qdrant. Make sure it is running and ingest has been run." });
+    // 3. RESPOND — answer (+ retrieved context for the document tool) plus
+    //    planner/execution metadata: tool, reason, status, executionTimeMs.
+    const payload = { ...result, reason: decision.reason };
+
+    if (result.status === "error") {
+      // Tool-level failure (e.g. Qdrant down) -> 500 with full metadata.
+      return res.status(500).json(payload);
     }
+    res.json(payload);
+  } catch (error) {
+    console.error("[ask] error:", error);
+    res.status(500).json({ error: "Failed to process query", details: error.message });
+  }
+});
 
-    const retriever = vectorStore.asRetriever({ k: 3 });
-
-    const llm = new ChatOpenAI({
-      apiKey: process.env.OPENROUTER_API_KEY,
-      configuration: {
-        baseURL: "https://openrouter.ai/api/v1",
-        defaultHeaders: {
-          "HTTP-Referer": "http://localhost:3000",
-          "X-Title": "Node RAG App",
-        }
-      },
-      modelName: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-      temperature: 0.2,
-    });
-
-    const systemTemplate = `You are a helpful assistant for question-answering tasks. 
-Use the following pieces of retrieved context to answer the question. 
-If you don't know the answer, just say that you don't know. 
-Keep the answer concise.
-
-Context:
-{context}
-
-Answer:`;
-
-    const prompt = ChatPromptTemplate.fromMessages([
-      ["system", systemTemplate],
-      ["human", "{input}"],
-    ]);
-
-  const lowerQuery = query.toLowerCase();
-
-let selectedTool = "document";
-
-if (
-    lowerQuery.includes("calculate") ||
-    lowerQuery.includes("+") ||
-    lowerQuery.includes("-") ||
-    lowerQuery.includes("*") ||
-    lowerQuery.includes("/")
-) {
-    selectedTool = "calculator";
-}
-else if (
-    lowerQuery.includes("today") ||
-    lowerQuery.includes("date") ||
-    lowerQuery.includes("time")
-) {
-    selectedTool = "date";
-}
-
-if (selectedTool === "document") {
-    // Existing RAG code
-}
-else if (selectedTool === "calculator") {
-    // Calculator
-}
-else if (selectedTool === "date") {
-    // Date
-}
-
-const context = retrievedDocs.map((doc) => doc.pageContent).join("\n\n");
-
-    const chain = RunnableSequence.from([
-      prompt,
-      llm,
-      new StringOutputParser()
-    ]);
-
-    const answer = await chain.invoke({
-      context: context,
-      input: query,
-    });
-    
+/**
+ * DELETE /api/documents — clear the entire knowledge base (Qdrant collection).
+ * The collection is recreated automatically on the next upload.
+ */
+app.delete("/api/documents", async (_req, res) => {
+  try {
+    const { deleted } = await clearCollection();
+    console.log(`[documents] cleared knowledge base (deleted=${deleted})`);
     res.json({
-      answer: answer,
-      context: retrievedDocs.map(doc => doc.pageContent),
+      message: deleted
+        ? "Knowledge base cleared."
+        : "Knowledge base was already empty.",
     });
   } catch (error) {
-    console.error("Error during ask:", error);
-    res.status(500).json({ error: "Failed to process query", details: error.message });
+    console.error("[documents] clear error:", error);
+    res.status(500).json({ error: "Failed to clear documents", details: error.message });
   }
 });
 
 app.listen(port, () => {
   console.log(`Backend server listening at http://localhost:${port}`);
 });
-
-import { plan } from "./agent/planner.js";
