@@ -18,7 +18,7 @@
  * Every decision is logged for debugging and demo purposes.
  */
 
-import { createLLM } from "../services/llm.js";
+import { createLLM, isRateLimitError } from "../services/llm.js";
 
 /** The only tool names the planner is allowed to choose. */
 const VALID_TOOLS = ["document", "calculator", "date", "web"];
@@ -89,6 +89,11 @@ Question: ${query}`;
       };
     }
   } catch (error) {
+    // Rate limits are terminal for this request: the document fallback would
+    // hit the same 429 again. Surface it so the API layer can return a
+    // friendly 429 response instead of a confusing tool error.
+    if (isRateLimitError(error)) throw error;
+
     // Planner LLM unreachable — degrade to the default tool rather than
     // failing the whole request.
     decision = {

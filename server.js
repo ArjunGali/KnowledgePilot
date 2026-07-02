@@ -31,6 +31,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { plan } from "./agent/planner.js";
 import { execute } from "./agent/executor.js";
 import { ingestDocuments, clearCollection } from "./services/qdrant.js";
+import { isRateLimitError, RATE_LIMIT_MESSAGE } from "./services/llm.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -169,11 +170,22 @@ app.post("/api/ask", async (req, res) => {
     const payload = { ...result, reason: decision.reason };
 
     if (result.status === "error") {
-      // Tool-level failure (e.g. Qdrant down) -> 500 with full metadata.
+      // Provider rate limit inside a tool (e.g. document LLM call) ->
+      // friendly 429, never the raw API error text.
+      if (isRateLimitError(result.error)) {
+        console.warn("[ask] OpenRouter rate limit hit (tool)");
+        return res.status(429).json({ ...payload, error: RATE_LIMIT_MESSAGE });
+      }
+      // Other tool-level failure (e.g. Qdrant down) -> 500 with metadata.
       return res.status(500).json(payload);
     }
     res.json(payload);
   } catch (error) {
+    // Rate limit thrown before a tool ran (planner) -> same friendly 429.
+    if (isRateLimitError(error)) {
+      console.warn("[ask] OpenRouter rate limit hit (planner)");
+      return res.status(429).json({ error: RATE_LIMIT_MESSAGE });
+    }
     console.error("[ask] error:", error);
     res.status(500).json({ error: "Failed to process query", details: error.message });
   }

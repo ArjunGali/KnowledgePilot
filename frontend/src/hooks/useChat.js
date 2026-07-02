@@ -24,6 +24,10 @@ function loadMessages() {
 /** Turn a raw error message into a friendly, on-brand UI line. */
 function friendlyError(message = "") {
   const m = message.toLowerCase();
+  // Safety net: the backend already maps 429s to friendly text, but never
+  // show a raw provider rate-limit error even if one slips through.
+  if (m.includes("rate limit") || m.includes("429") || m.includes("free-model"))
+    return "OpenRouter's daily free-model limit has been reached. Please add credits, switch to another configured model, or try again after the quota resets.";
   if (m.includes("qdrant") || m.includes("collection") || m.includes("ingest"))
     return "No documents uploaded yet. Upload a PDF, DOCX or TXT to start asking questions.";
   if (m.includes("failed to fetch") || m.includes("network"))

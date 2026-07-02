@@ -55,5 +55,28 @@ export function createLLM({ modelName = DEFAULT_MODEL, temperature = 0.2 } = {})
     },
     modelName,
     temperature,
+    // Do NOT retry failed calls. OpenRouter free-tier 429s are daily quotas:
+    // retrying cannot succeed and previously hung the UI for ~100s honouring
+    // retry-after backoff. Failing fast lets the API return a friendly
+    // rate-limit message immediately; transient errors just surface and the
+    // user can resend.
+    maxRetries: 0,
   });
+}
+
+/** Friendly, user-facing text for provider rate limits (no raw API errors). */
+export const RATE_LIMIT_MESSAGE =
+  "OpenRouter's daily free-model limit has been reached. " +
+  "Please add credits, switch to another configured model, or try again after the quota resets.";
+
+/**
+ * True when an error (Error object or plain message string) is a provider
+ * rate limit — HTTP 429 or a "rate limit" message from OpenRouter/LangChain.
+ *
+ * @param {unknown} err - Error instance or error-message string
+ * @returns {boolean}
+ */
+export function isRateLimitError(err) {
+  const msg = typeof err === "string" ? err : err?.message ?? "";
+  return err?.status === 429 || /\b429\b|rate.?limit/i.test(msg);
 }
