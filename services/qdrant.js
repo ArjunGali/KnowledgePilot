@@ -45,17 +45,47 @@ export async function getVectorStore() {
 }
 
 /**
+ * Retry a Qdrant operation that fails with a transient network error
+ * (ECONNRESET / "fetch failed" / socket hang up). These appear mainly on the
+ * first large write of a fresh server run and succeed on a quick retry, so we
+ * retry automatically instead of surfacing the failure to the user.
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withRetry(fn, attempts = 3, baseDelayMs = 800) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const detail = `${error?.message ?? ""} ${error?.cause?.message ?? ""}`;
+      const transient =
+        /ECONNRESET|fetch failed|socket hang up|ETIMEDOUT|ECONNREFUSED/i.test(detail);
+      if (!transient || i === attempts - 1) throw error;
+      console.warn(
+        `[qdrant] transient write error (attempt ${i + 1}/${attempts}) — retrying: ${detail.trim()}`
+      );
+      await new Promise((r) => setTimeout(r, baseDelayMs * (i + 1)));
+    }
+  }
+}
+
+/**
  * Write document chunks (already split) into the collection.
- * Used by both the /api/ingest endpoint and the ingest.js CLI.
+ * Used by both the /api/ingest endpoint and the ingest.js CLI. Wrapped in a
+ * transient-error retry so the first cold-start write can't fail the upload.
  *
  * @param {import("@langchain/core/documents").Document[]} docs
  * @returns {Promise<QdrantVectorStore>}
  */
 export async function ingestDocuments(docs) {
-  return QdrantVectorStore.fromDocuments(docs, embeddings, {
-    url: QDRANT_URL,
-    collectionName: COLLECTION_NAME,
-  });
+  return withRetry(() =>
+    QdrantVectorStore.fromDocuments(docs, embeddings, {
+      url: QDRANT_URL,
+      collectionName: COLLECTION_NAME,
+    })
+  );
 }
 
 /**

@@ -32,6 +32,7 @@ import { plan } from "./agent/planner.js";
 import { execute } from "./agent/executor.js";
 import { ingestDocuments, clearCollection } from "./services/qdrant.js";
 import { isRateLimitError, RATE_LIMIT_MESSAGE } from "./services/llm.js";
+import { warmUpEmbeddings } from "./services/embeddings.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -210,6 +211,15 @@ app.delete("/api/documents", async (_req, res) => {
   }
 });
 
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`Backend server listening at http://localhost:${port}`);
+  // Preload the local embedding model so the FIRST upload/query is fast and
+  // the first Qdrant write doesn't get dropped mid-request.
+  try {
+    console.log("[startup] warming up local embedding model...");
+    await warmUpEmbeddings();
+    console.log("[startup] embedding model ready.");
+  } catch (err) {
+    console.warn("[startup] embedding warm-up failed (will load on first use):", err.message);
+  }
 });

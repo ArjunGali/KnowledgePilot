@@ -71,3 +71,14 @@ class LocalEmbeddings extends Embeddings {
 
 /** Shared singleton — import this everywhere embeddings are needed. */
 export const embeddings = new LocalEmbeddings();
+
+/**
+ * Preload the embedding model. Called once at server startup so the FIRST
+ * upload/query doesn't pay the one-time model-load cost mid-request — that
+ * cold-start delay is what previously made the first ingest slow enough for
+ * the large Qdrant write to drop (ECONNRESET), forcing a manual retry.
+ * @returns {Promise<void>}
+ */
+export async function warmUpEmbeddings() {
+  await embeddings.getPipeline();
+}
